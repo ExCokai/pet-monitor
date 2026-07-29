@@ -1,0 +1,17 @@
+# Compiled
+*.o
+*.a
+*.so
+*.bin
+*.elf
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temp
+*~
+.DS_Store
+Thumbs.db
