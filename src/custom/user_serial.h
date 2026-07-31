@@ -17,6 +17,11 @@ struct rx_msg
     rt_size_t size;
 };
 
+/* 传感器共享数据（线程安全访问） */
+extern rt_mutex_t g_data_mutex;
+extern volatile int g_data_changed;
+extern volatile int g_data_valid;
+
 int uart3_serial_init(void);
 void update_temperature_humidity(float temperature, int humidity);
 void update_ui_display(void);

@@ -11,19 +11,23 @@
 #include <rtdevice.h>
 
 static rt_mq_t g_rx_mq;
-rt_device_t g_serial;  // 改为非静态，供 ctrl_serial 使用
+rt_device_t g_serial;
 static rt_thread_t g_uart3_thread;
+
+/* 互斥锁：保护传感器全局数据的线程安全访问 */
+rt_mutex_t g_data_mutex = RT_NULL;
 
 #define RX_BUF_SIZE 128
 static char g_rx_buf[RX_BUF_SIZE];
 static int g_rx_idx = 0;
 
-static int g_env_temperature = 0;      // 环境温度（T1）
-static float g_pet_temperature = 0.0f; // 宠物体温（T2），支持小数
+static int g_env_temperature = 0;
+static float g_pet_temperature = 0.0f;
 static int g_humidity = 0;
-static int g_water_status = 0;          // 水量状态：0=缺水，1=充足
-static int g_feces_count = 0;           // 大便次数
-static int g_data_valid = 0;
+static int g_water_status = 0;
+static int g_feces_count = 0;
+volatile int g_data_valid = 0;
+volatile int g_data_changed = 0;
 
 static rt_err_t serial_input_mq(rt_device_t dev, rt_size_t size);
 static int parse_temperature_humidity(char *data, int *t1, float *t2, int *h, int *w, int *f);
@@ -42,6 +46,15 @@ int uart3_serial_init(void)
     g_water_status = 0;
     g_feces_count = 0;
     g_data_valid = 0;
+    g_data_changed = 0;
+
+    /* 创建互斥锁保护传感器数据（LVGL线程 vs UART3线程） */
+    g_data_mutex = rt_mutex_create("data_mtx", RT_IPC_FLAG_PRIO);
+    if (!g_data_mutex)
+    {
+        rt_kprintf("uart3_serial_init: mutex create failed!\n");
+        return -1;
+    }
 
     g_rx_mq = rt_mq_create("uart3_rx_mq", sizeof(struct rx_msg), UART3_MQ_SIZE, RT_IPC_FLAG_FIFO);
     if (!g_rx_mq)
@@ -174,12 +187,17 @@ static void uart3_thread_entry(void *parameter)
                 float t2 = 0.0f;
                 if (parse_temperature_humidity(g_rx_buf, &t1, &t2, &h, &w, &f) == 0)
                 {
-                    g_env_temperature = t1; // 环境温度
-                    g_pet_temperature = t2; // 宠物体温（支持小数）
+                    /* ---- 临界区：更新全局传感器数据 ---- */
+                    rt_mutex_take(g_data_mutex, RT_WAITING_FOREVER);
+                    g_env_temperature = t1;
+                    g_pet_temperature = t2;
                     g_humidity = h;
-                    g_water_status = w;    // 水量状态
-                    g_feces_count = f;     // 大便次数
+                    g_water_status = w;
+                    g_feces_count = f;
                     g_data_valid = 1;
+                    g_data_changed = 1;  // 通知 UI 有新数据
+                    rt_mutex_release(g_data_mutex);
+                    /* ----------------------------------- */
                     // 清空缓冲区
                     g_rx_idx = 0;
                     g_rx_buf[0] = '\0';
@@ -306,45 +324,63 @@ static int parse_temperature_humidity(char *data, int *t1, float *t2, int *h, in
 
 void update_ui_display(void)
 {
-    if (!g_data_valid) return;
-    
+    if (!g_data_mutex) return;
+
+    /* ---- 临界区：检查 + 读取传感器数据 ---- */
+    rt_mutex_take(g_data_mutex, RT_WAITING_FOREVER);
+
+    if (!g_data_valid || !g_data_changed) {
+        rt_mutex_release(g_data_mutex);
+        return;  // 数据没变化，跳过刷新
+    }
+
+    // 复制数据到局部变量（避免长时间持锁）
+    int t1 = g_env_temperature;
+    float t2 = g_pet_temperature;
+    int h = g_humidity;
+    int w = g_water_status;
+    int f = g_feces_count;
+    g_data_changed = 0;
+    rt_mutex_release(g_data_mutex);
+    /* ------------------------------------------- */
+
+    // ↓↓↓ 以下在锁外执行 LVGL UI 操作 ↓↓↓
+
     lv_obj_t *active_screen = lv_scr_act();
-    
+
     if (active_screen == ui_manager.screen.obj) {
         char temp_str[32];
         char hum_str[32];
         char combined[64];
 
         if (ui_manager.screen.label_1) {
-            snprintf(combined, sizeof(combined), "温湿度：%d℃/%d%%", g_env_temperature, g_humidity);
+            snprintf(combined, sizeof(combined), "温湿度：%d℃/%d%%", t1, h);
             lv_label_set_text(ui_manager.screen.label_1, combined);
         }
         if (ui_manager.screen.label_2) {
-            snprintf(temp_str, sizeof(temp_str), "%d/", g_env_temperature);
+            snprintf(temp_str, sizeof(temp_str), "%d/", t1);
             lv_label_set_text(ui_manager.screen.label_2, temp_str);
         }
         if (ui_manager.screen.label_3) {
-            snprintf(hum_str, sizeof(hum_str), "%d%%", g_humidity);
+            snprintf(hum_str, sizeof(hum_str), "%d%%", h);
             lv_label_set_text(ui_manager.screen.label_3, hum_str);
         }
         if (ui_manager.screen.label_4) {
-            snprintf(temp_str, sizeof(temp_str), "宠物体温：%d.%d℃", 
-                     (int)g_pet_temperature, (int)(g_pet_temperature * 10) % 10);
+            snprintf(temp_str, sizeof(temp_str), "宠物体温：%d.%d℃",
+                     (int)t2, (int)(t2 * 10) % 10);
             lv_label_set_text(ui_manager.screen.label_4, temp_str);
         }
         if (ui_manager.screen.label_5) {
-            snprintf(temp_str, sizeof(temp_str), "%d.%d℃", 
-                     (int)g_pet_temperature, (int)(g_pet_temperature * 10) % 10);
+            snprintf(temp_str, sizeof(temp_str), "%d.%d℃",
+                     (int)t2, (int)(t2 * 10) % 10);
             lv_label_set_text(ui_manager.screen.label_5, temp_str);
         }
-        // 更新水量状态（label_6）
         if (ui_manager.screen.label_6) {
-            const char *water_text = g_water_status ? "      水量充足" : "缺水！请及时加水";
+            const char *water_text = w ? "      水量充足" : "缺水！请及时加水";
             lv_label_set_text(ui_manager.screen.label_6, water_text);
         }
-        // 更新大便次数（label_7）
         if (ui_manager.screen.label_7) {
-            snprintf(temp_str, sizeof(temp_str), "大便次数：%d", g_feces_count);
+            snprintf(temp_str, sizeof(temp_str), "大便次数：%d", f);
             lv_label_set_text(ui_manager.screen.label_7, temp_str);
         }
     }
@@ -352,8 +388,12 @@ void update_ui_display(void)
 
 void update_temperature_humidity(float temperature, int humidity)
 {
-    // 这个函数保留给外部调用（兼容旧接口）
+    if (!g_data_mutex) return;
+    // 兼容旧接口，带互斥保护
+    rt_mutex_take(g_data_mutex, RT_WAITING_FOREVER);
     g_env_temperature = (int)temperature;
     g_humidity = humidity;
     g_data_valid = 1;
+    g_data_changed = 1;
+    rt_mutex_release(g_data_mutex);
 }

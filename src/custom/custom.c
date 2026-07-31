@@ -10,6 +10,108 @@
 #include "ctrl_serial.h"
 #include "ui_objects.h"
 #include <rtthread.h>
+#include <rtdevice.h>
+
+/* ==================== 背光管理 ==================== */
+
+#define BACKLIGHT_PWM_CH        2          // PWM 通道（对应 AIC_PWM_BACKLIGHT_CHANNEL）
+#define BACKLIGHT_PWM_PERIOD    1000000    // PWM 周期 1M ns = 1KHz
+#define BACKLIGHT_DIM_LEVEL     10         // 变暗时的亮度 (%)
+#define BACKLIGHT_DIM_TIMEOUT   (5 * 1000) // 5s 无操作降至低亮
+#define BACKLIGHT_OFF_TIMEOUT   (10 * 1000) // 10s 无操作完全熄屏
+
+static rt_device_t  g_pwm_dev = RT_NULL;
+static rt_tick_t    g_last_touch_tick = 0;
+static int          g_backlight_brightness = 80; // 当前亮度 0-100
+static int          g_backlight_state = 1;       // 1=正常, 0=变暗, -1=关闭
+static lv_timer_t  *g_backlight_timer = NULL;
+
+/** 设置背光亮度
+ *  @param level 0-100, 0=关闭PWM
+ */
+static void backlight_set_brightness(int level)
+{
+    if (!g_pwm_dev) return;
+
+    if (level <= 0) {
+        rt_pwm_disable(g_pwm_dev, BACKLIGHT_PWM_CH);
+        g_backlight_state = -1;
+    } else {
+        rt_pwm_set(g_pwm_dev, BACKLIGHT_PWM_CH,
+                   BACKLIGHT_PWM_PERIOD,
+                   10000 * level);  // duty_ns = level * 10000
+        rt_pwm_enable(g_pwm_dev, BACKLIGHT_PWM_CH);
+        g_backlight_state = (level <= BACKLIGHT_DIM_LEVEL) ? 0 : 1;
+    }
+}
+
+/** 触摸/按压事件：重置空闲计时，恢复背光 */
+static void backlight_touch_cb(lv_event_t *e)
+{
+    (void)e;  // 不使用事件参数
+    g_last_touch_tick = rt_tick_get();
+
+    // 如果背光被调暗或关闭了，恢复
+    if (g_backlight_state <= 0) {
+        backlight_set_brightness(g_backlight_brightness);
+        rt_kprintf("BL: restored to %d%%\n", g_backlight_brightness);
+    }
+}
+
+/** 背光超时检查（每秒触发）
+ *
+ *  状态机: 正常(1) → 变暗(0) → 关闭(-1)
+ *
+ *  dim 和 off 都只从"正常"状态进入，因为一旦变暗后
+ *  g_backlight_state 变成 0，原来的 off 条件 (state==1) 就失效了。
+ *  修复: off 条件改为 state != -1（非关闭状态即可进入关闭）
+ */
+static void backlight_timeout_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    rt_tick_t idle_ms = rt_tick_get() - g_last_touch_tick;
+
+    // 先检查 OFF（级联优先），只要不是已经关闭的状态都能关
+    if (g_backlight_state != -1 && idle_ms >= BACKLIGHT_OFF_TIMEOUT) {
+        backlight_set_brightness(0);
+        rt_kprintf("BL: off (idle %lu ms)\n", idle_ms);
+    } else if (g_backlight_state == 1 && idle_ms >= BACKLIGHT_DIM_TIMEOUT) {
+        backlight_set_brightness(BACKLIGHT_DIM_LEVEL);
+        rt_kprintf("BL: dim %d%% (idle %lu ms)\n", BACKLIGHT_DIM_LEVEL, idle_ms);
+    }
+}
+
+/** 初始化背光管理 */
+static void backlight_init(void)
+{
+    g_pwm_dev = rt_device_find("pwm");
+    if (!g_pwm_dev) {
+        rt_kprintf("BL: PWM device not found!\n");
+        return;
+    }
+
+    // 设置初始亮度
+    g_last_touch_tick = rt_tick_get();
+    backlight_set_brightness(g_backlight_brightness);
+
+    // 注册触摸唤醒（遍历所有输入设备，找触摸屏）
+    lv_indev_t *indev = lv_indev_get_next(NULL);
+    while (indev) {
+        if (lv_indev_get_type(indev) == LV_INDEV_TYPE_POINTER) {
+            lv_indev_add_event_cb(indev, backlight_touch_cb,
+                                  LV_EVENT_PRESSED, NULL);
+            rt_kprintf("BL: touch wakeup registered\n");
+        }
+        indev = lv_indev_get_next(indev);
+    }
+
+    // 1 秒检查一次超时
+    g_backlight_timer = lv_timer_create(backlight_timeout_cb, 1000, NULL);
+
+    rt_kprintf("BL: init OK, brightness=%d%%\n", g_backlight_brightness);
+}
+
+/* ==================== 开关事件 ==================== */
 
 void switch_event_cb(lv_event_t *e)
 {
@@ -30,5 +132,8 @@ void custom_init()
 {
     ctrl_serial_init();
     uart3_serial_init();
-    lv_timer_create(ui_update_timer_cb, 100, NULL);
+    // 500ms 刷新一次，但只在数据变化时才更新UI
+    lv_timer_create(ui_update_timer_cb, 500, NULL);
+    // 背光超时管理
+    backlight_init();
 }
