@@ -44,20 +44,26 @@
 - **已知问题**: 变暗/关闭后触摸不恢复（`lv_indev_add_event_cb` 在 LVGL v9 可能不触发，需改用轮询方式）
 - **效果**: 无人操作 60s 后屏幕背光完全关闭
 
-### 步骤 3: UART3 线程休眠优化
+### 步骤 3: UART3 线程休眠优化 ✅
 - **文件**: `src/custom/user_serial.c`
-- **改动**: `rt_mq_recv` 超时从 10ms 改为 500ms，移除循环中的多余 `rt_thread_mdelay`
-- **效果**: 无线数据时线程长时间阻塞，PM 框架可以进入深度睡眠
+- **改动**:
+  - `rt_mq_recv` 超时从 `10ms` → `500ms`（`RT_TICK_PER_SECOND=1000`，即 500 ticks）
+  - 移除 `while(1)` 末尾的 `rt_thread_mdelay(10)`（mq_recv 已阻塞，不需要额外延时）
+- **效果**: 无传感器数据时线程阻塞 500ms，PM 框架有足够窗口进入深度睡眠
 
-### 步骤 4: 配置 UART3 RX 引脚为唤醒源
+### 步骤 4: 配置 UART3 RX 引脚为唤醒源 ✅
 - **文件**: `src/custom/user_serial.c`
-- **改动**: 调用 `rt_pm_set_pin_wakeup_source()` 标记 UART3 RX 引脚
-- **效果**: 深度睡眠后传感器数据能唤醒 MCU
+- **改动**:
+  - 新增 `#include <drivers/pm.h>`
+  - `uart3_serial_init()` 中调用 `rt_pm_set_pin_wakeup_source(rt_pin_get("PA.7"))`
+- **效果**: 深度睡眠时 UART3 RX(PA.7) 的 GPIO 中断不会被屏蔽，传感器数据到来能唤醒 MCU
 
-### 步骤 5: 熄屏后暂停 UI 刷新
+### 步骤 5: 熄屏后暂停 UI 刷新 ✅
 - **文件**: `src/custom/custom.c`
-- **改动**: 熄屏时暂停 LVGL 数据刷新定时器，亮屏时恢复
-- **效果**: 熄屏期间系统可以稳定进入深度睡眠
+- **改动**:
+  - 新增 `g_ui_timer` 指针保存数据刷新定时器
+  - `backlight_set_brightness()`: 熄屏时 `lv_timer_pause(g_ui_timer)`，亮屏时 `lv_timer_resume(g_ui_timer)`
+- **效果**: 熄屏后系统不被 500ms 定时器唤醒，可以稳定进入深度睡眠
 
 ### 步骤 6: 触摸唤醒 + 完整休眠流程 (合并到步骤2修复)
 - **文件**: `src/custom/custom.c`

@@ -25,6 +25,7 @@ static rt_tick_t    g_last_touch_tick = 0;
 static int          g_backlight_brightness = 80; // 当前亮度 0-100
 static int          g_backlight_state = 1;       // 1=正常, 0=变暗, -1=关闭
 static lv_timer_t  *g_backlight_timer = NULL;
+static lv_timer_t  *g_ui_timer = NULL;           // 数据刷新定时器（熄屏时暂停）
 
 /** 设置背光亮度
  *  @param level 0-100, 0=关闭PWM
@@ -34,9 +35,13 @@ static void backlight_set_brightness(int level)
     if (!g_pwm_dev) return;
 
     if (level <= 0) {
+        // 熄屏 → 暂停数据刷新，省掉无意义的 UI 绘制
+        if (g_ui_timer) lv_timer_pause(g_ui_timer);
         rt_pwm_disable(g_pwm_dev, BACKLIGHT_PWM_CH);
         g_backlight_state = -1;
     } else {
+        // 亮屏 → 恢复数据刷新
+        if (g_ui_timer) lv_timer_resume(g_ui_timer);
         rt_pwm_set(g_pwm_dev, BACKLIGHT_PWM_CH,
                    BACKLIGHT_PWM_PERIOD,
                    10000 * level);  // duty_ns = level * 10000
@@ -133,7 +138,7 @@ void custom_init()
     ctrl_serial_init();
     uart3_serial_init();
     // 500ms 刷新一次，但只在数据变化时才更新UI
-    lv_timer_create(ui_update_timer_cb, 500, NULL);
+    g_ui_timer = lv_timer_create(ui_update_timer_cb, 500, NULL);
     // 背光超时管理
     backlight_init();
 }

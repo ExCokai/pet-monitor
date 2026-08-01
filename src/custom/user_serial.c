@@ -9,6 +9,7 @@
 #include "aic_ui.h"
 #include <rtthread.h>
 #include <rtdevice.h>
+#include <drivers/pm.h>
 
 static rt_mq_t g_rx_mq;
 rt_device_t g_serial;
@@ -88,6 +89,14 @@ int uart3_serial_init(void)
     rt_device_set_rx_indicate(g_serial, serial_input_mq);//设置接收回调函数
     rt_kprintf("uart3_serial_init: rx indicate callback set\n");
 
+    /* 将 UART3 RX 引脚(PA.7) 标记为唤醒源，
+     * 确保深度睡眠时传感器数据到来能唤醒 MCU */
+    rt_base_t uart3_rx_pin = rt_pin_get("PA.7");
+    if (uart3_rx_pin >= 0) {
+        rt_pm_set_pin_wakeup_source(uart3_rx_pin);
+        rt_kprintf("uart3_serial_init: PA.7 set as wakeup source\n");
+    }
+
     g_uart3_thread = rt_thread_create("uart3_recv",
                                       uart3_thread_entry,
                                       RT_NULL,
@@ -149,8 +158,8 @@ static void uart3_thread_entry(void *parameter)
 
     while (1)
     {
-        // 检查是否有数据收到（非阻塞，超时10ms）
-        ret = rt_mq_recv(g_rx_mq, &msg, sizeof(msg), 10);
+        // 阻塞等待消息，超时 500ms（允许 PM 框架在此期间进入睡眠）
+        ret = rt_mq_recv(g_rx_mq, &msg, sizeof(msg), 500);
         if (ret == RT_EOK)
         {
             // 检查消息队列中的设备指针是否有效
@@ -216,7 +225,7 @@ static void uart3_thread_entry(void *parameter)
             rt_kprintf("uart3_thread_entry: rt_mq_recv error, ret=%d\n", ret);
         }
 
-        rt_thread_mdelay(10); // 延时 10ms
+        // 不额外延时：mq_recv 已经阻塞等待，超时后直接下一轮
     }
 }
 
